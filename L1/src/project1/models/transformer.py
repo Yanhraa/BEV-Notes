@@ -67,9 +67,8 @@ class Transformer(nn.Module):
 
         # (bs, h, w)->(bs, h*w)
         mask = mask.flatten(1)
-
-        # 3. 使用编码器处理输入序列，得到具有全局相关性（增强后）的特征表示
         tgt = torch.zeros_like(query_embed)
+        # 3. 使用编码器处理输入序列，得到具有全局相关性（增强后）的特征表示
         '''     
             encoder
             def forward(self, src,
@@ -90,7 +89,7 @@ class Transformer(nn.Module):
                 pos: Optional[Tensor] = None,
                 query_pos: Optional[Tensor] = None):
         '''
-        hs = self.decoder(tgt, memory, memory_key_padding_mask=mask, 
+        output = self.decoder(tgt, memory, memory_key_padding_mask=mask, 
                           pos=pos_embed, 
                           query_pos=query_embed)
 
@@ -99,7 +98,7 @@ class Transformer(nn.Module):
         # encoder输出 [bs, 256, H, W]
 
         # ()
-        # return hs.transpose(1, 2), memory.permute(1, 2, 0).view(bs, c, h, w) 
+        return output.transpose(1, 2), memory.permute(1, 2, 0).view(bs, c, h, w) 
         # pass
 
 
@@ -124,10 +123,10 @@ class TransformerEncoder(nn.Module):
         for layer in self.layers:
             output = layer(output, src_mask=mask,
                            src_key_padding_mask=src_key_padding_mask, pos=pos)
-        # 2. layer norm
-        # if self.norm is not None:
+        # 2. layer norm（如果self.norm不为None）
+        if self.norm is not None:
         # 对输出层进行归一化
-        output = self.norm(output)
+            output = self.norm(output)
         # 3. 得到最终编码器的输出
         return output
         # pass
@@ -151,12 +150,34 @@ class TransformerDecoder(nn.Module):
                 pos: Optional[Tensor] = None,
                 query_pos: Optional[Tensor] = None):
         # TODO: 实现 Transformer 解码器的前向传播逻辑
-        # 1. 遍历$num_layers层TransformerDecoderLayer，对每一层解码器进行前向传播，并处理return_intermediate为True的情况
+        # 1. 遍历$num_layers层TransformerDecoderLayer，对每一层解码器进行前向传播，
+        # 并处理return_intermediate为True的情况
+        output = tgt
+        # 用于存储中间层的输出
+        intermediate = []
 
+        for layer in self.layers:
+            output = layer(output, memory, tgt_mask=tgt_mask,
+                           memory_mask=memory_mask,
+                           tgt_key_padding_mask=tgt_key_padding_mask,
+                           memory_key_padding_mask=memory_key_padding_mask,
+                           pos=pos,query_pos=query_pos)
+            if self.return_intermediate:
+                intermediate.append(self.norm(output))
         # 2. 应用最终的归一化层layer norm
-
+        if self.norm is not None:
+            output = self.norm(output)
+            if self.return_intermediate:
+                intermediate.pop()
+                intermediate.append(output)
+            
         # 3. 如果设置了返回中间结果，则将它们堆叠起来返回；否则，返回最终输出
-        pass
+        if self.return_intermediate:
+            # 通过stack堆叠成一个张量并返回
+            return torch.stack(intermediate)
+            
+        return output.unsqueeze(0)
+        # pass
 
 
 class TransformerEncoderLayer(nn.Module):
@@ -194,7 +215,17 @@ class TransformerEncoderLayer(nn.Module):
         pos: [494, bs, 256]  位置编码
         """
         # TODO: 实现 Transformer 编码器层的前向传播逻辑（参考DETR论文中Section A.3 & Fig.10）
-        pass 
+        q = k = self.with_pos_embed(src, pos)
+        src_msa = self.self_attn(query=q, key=k, value=src, attn_mask=src_mask,
+                                 key_padding_mask=src_key_padding_mask)[0]
+        output = src + self.dropout1(src_msa)
+        output = self.norm1(output)
+        src_msa = self.linear2(self.dropout(self.activation(self.linear1(output))))
+        output = output + self.dropout2(src_msa)
+        output = self.norm2(output)
+
+        return output
+        # pass 
  
 
     def forward_pre(self, src,
@@ -209,10 +240,24 @@ class TransformerEncoderLayer(nn.Module):
         pos: [494, bs, 256]  位置编码
         """
         # TODO: 实现 Transformer 编码器层的前向传播逻辑（参考DETR论文中Section A.3 & Fig.10）
+        # 而是在此处对输入进行LN 
+        src_msa = src.norm1(src)
         # 加上位置编码
-        q = k = self.with_pos_embed(tgt, pos)
+        q = k = self.with_pos_embed(src_msa, pos)
         # MSA:self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
-        MSA = self.self_attn(q, k, )
+        # 也许此处不需要attn_mask，因为做的就是全局的注意力
+        # class
+        src_msa = self.self_attn(query=q, key=k, value=src_msa, attn_mask=src_mask,
+                                 key_padding_mask=src_key_padding_mask)[0]
+        # Self Attention与残差连接，并应用dropout防止过拟合
+        output = src + self.dropout1(src_msa)
+        # 对残差连接结果进行LN
+        output = self.nor2(output)
+        # 进行线性变换，激活函数处理，然后应用dropout
+        src_msa = self.linear2(self.dropout(self.activation(self.linear1(output))))
+        # 将线性变换后的输出与残差连接的结果相加
+        output = output + self.dropout2(src_msa)
+        return output
         # pass
 
     def forward(self, src,
@@ -220,8 +265,8 @@ class TransformerEncoderLayer(nn.Module):
                 src_key_padding_mask: Optional[Tensor] = None,
                 pos: Optional[Tensor] = None):
         if self.normalize_before:
-            # 先对输入进行LN
-            tgt = tgt.norm1(tgt)
+            # 先对输入进行LN 
+            # ViT结构中不应该在此处进行LN
             return self.forward_pre(src, src_mask, src_key_padding_mask, pos)
         return self.forward_post(src, src_mask, src_key_padding_mask, pos)
 
@@ -270,7 +315,28 @@ class TransformerDecoderLayer(nn.Module):
         tgt_mask、memory_mask、tgt_key_padding_mask是防止作弊的 这里都没有使用
         """
         # TODO: 实现 Transformer 解码器层的前向传播逻辑（参考DETR论文中Section A.3 & Fig.10）
-        pass
+        q = k = self.with_pos_embed(tgt, query_pos)
+        tgt_mha = self.self_attn(q, k, value=tgt, attn_mask=tgt_mask,
+                                 key_padding_mask=tgt_key_padding_mask)[0]
+        output = tgt+self.dropout1(tgt_mha)
+        output = self.norm1(output)
+        # memory: [h*w, bs, 256]， Encoder的输出，具有全局相关性（增强后）的特征表示
+        k = self.with_pos_embed(memory, pos)
+        q = self.with_pos_embed(output, query_pos)
+        tgt_mha = self.multihead_attn(query=q,
+                                      key=k,
+                                      value=memory, attn_mask=memory_mask,
+                                      key_padding_mask=memory_key_padding_mask)[0]
+        
+        output = output + self.dropout2(tgt_mha)
+        output = self.norm2(output)
+        tgt_mha = self.linear2(self.dropout(self.activation(self.linear1(output))))
+        output = output + self.dropout3(tgt_mha)
+        output = self.norm3(output)
+
+
+        return output
+        # pass
 
     def forward_pre(self, tgt, memory,
                     tgt_mask: Optional[Tensor] = None,
@@ -291,9 +357,30 @@ class TransformerDecoderLayer(nn.Module):
         tgt_mask、memory_mask、tgt_key_padding_mask是防止作弊的 这里都没有使用
         """
         # TODO: 实现 Transformer 解码器层的前向传播逻辑（参考DETR论文中Section A.3 & Fig.10）
+        # 此处tgt应该是zeros
+        # tgt = torch.zeros_like(query_embed)
+        # 还有必要做ln吗？
+        tgt_mha = self.norm1(tgt)
+
+        q = k = self.with_pos_embed(tgt_mha, query_pos)
+        tgt_mha = self.self_attn(query=q, key=k, value=tgt_mha,
+                                 key_padding_mask=tgt_key_padding_mask)[0]
+        output = tgt+self.dropout1(tgt_mha)
+        output = self.norm2(output)
+        # memory: [h*w, bs, 256]， Encoder的输出，具有全局相关性（增强后）的特征表示
+        tgt_mha = self.multihead_attn(query=self.with_pos_embed(output, query_pos),
+                                      key=self.with_pos_embed(memory, pos),
+                                      value=memory, attn_msk=memory_mask,
+                                      key_padding_mask=memory_key_padding_mask)[0]
+        
+        output = output + self.dropout2(tgt_mha)
+        tgt_mha = self.norm3(output)
+        tgt_mha = self.linear2(self.dropout(self.activation(self.linear1(tgt_mha))))
+        output = output + self.dropout3(tgt_mha)
 
 
 
+        return output
         # pass
 
     def forward(self, tgt, memory,
@@ -305,7 +392,7 @@ class TransformerDecoderLayer(nn.Module):
                 query_pos: Optional[Tensor] = None):
         if self.normalize_before:
             # 先对输入进行LayerNorm
-            tgt = tgt.norm1(tgt)
+            # tgt = tgt.norm1(tgt)
             return self.forward_pre(tgt, memory, tgt_mask, memory_mask,
                                     tgt_key_padding_mask, memory_key_padding_mask, pos, query_pos)
         return self.forward_post(tgt, memory, tgt_mask, memory_mask,
